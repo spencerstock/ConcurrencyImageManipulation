@@ -2,6 +2,9 @@ package com.lambdaschool.concurrencyimagemanipulation;
 
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Color;
 import android.os.Bundle;
 import android.support.annotation.NonNull;
 import android.support.v7.app.AppCompatActivity;
@@ -12,11 +15,14 @@ import android.support.design.widget.Snackbar;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ImageView;
 import android.widget.TextView;
 
 import com.lambdaschool.concurrencyimagemanipulation.dummy.DummyContent;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Semaphore;
 
 /**
  * An activity representing a list of Items. This activity
@@ -66,16 +72,20 @@ public class ItemListActivity extends AppCompatActivity {
     }
 
     private void setupRecyclerView(@NonNull RecyclerView recyclerView) {
-        recyclerView.setAdapter(new SimpleItemRecyclerViewAdapter(this, DummyContent.ITEMS, mTwoPane));
+        recyclerView.setAdapter(new SimpleItemRecyclerViewAdapter(this, mTwoPane));
     }
 
     public static class SimpleItemRecyclerViewAdapter
             extends RecyclerView.Adapter<SimpleItemRecyclerViewAdapter.ViewHolder> {
 
-        private final ItemListActivity             mParentActivity;
-        private final List<DummyContent.DummyItem> mValues;
-        private final boolean                      mTwoPane;
-        private final View.OnClickListener         mOnClickListener = new View.OnClickListener() {
+        private final ItemListActivity          mParentActivity;
+        private final ArrayList<ImageContainer> mValues;
+        private final boolean                   mTwoPane;
+
+        private final Thread downloadThread, processingThread;
+        private final Semaphore imageListLock;
+
+        private final View.OnClickListener mOnClickListener = new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 DummyContent.DummyItem item = (DummyContent.DummyItem) view.getTag();
@@ -85,11 +95,11 @@ public class ItemListActivity extends AppCompatActivity {
                     ItemDetailFragment fragment = new ItemDetailFragment();
                     fragment.setArguments(arguments);
                     mParentActivity.getSupportFragmentManager().beginTransaction()
-                                   .replace(R.id.item_detail_container, fragment)
-                                   .commit();
+                            .replace(R.id.item_detail_container, fragment)
+                            .commit();
                 } else {
                     Context context = view.getContext();
-                    Intent  intent  = new Intent(context, ItemDetailActivity.class);
+                    Intent intent = new Intent(context, ItemDetailActivity.class);
                     intent.putExtra(ItemDetailFragment.ARG_ITEM_ID, item.id);
 
                     context.startActivity(intent);
@@ -98,24 +108,156 @@ public class ItemListActivity extends AppCompatActivity {
         };
 
         SimpleItemRecyclerViewAdapter(ItemListActivity parent,
-                                      List<DummyContent.DummyItem> items,
                                       boolean twoPane) {
-            mValues = items;
+            mValues = new ArrayList<ImageContainer>();
             mParentActivity = parent;
             mTwoPane = twoPane;
+            imageListLock = new Semaphore(1);
+
+            mValues.add(new ImageContainer("https://cdn.spacetelescope.org/archives/images/publicationjpg/heic1215b.jpg"));
+            mValues.add(new ImageContainer("https://i.redd.it/oal0dnbot2m21.jpg"));
+            mValues.add(new ImageContainer("https://cdn.spacetelescope.org/archives/images/screen/heic1206a.jpg"));
+            mValues.add(new ImageContainer("https://cdn.spacetelescope.org/archives/images/screen/heic0601a.jpg"));
+
+
+            downloadThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    if (mValues.size() > 0) {
+                        for (final ImageContainer containter : mValues) {
+                            try {
+                                imageListLock.acquire();
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                            }
+                            NetworkAdapter.backgroundBitmapFromUrl(containter.getUrl(), new NetworkAdapter.NetworkImageCallback() {
+
+                                @Override
+                                public void processImage(Bitmap image) {
+                                    try {
+                                        imageListLock.acquire();
+                                    } catch (InterruptedException e) {
+                                        e.printStackTrace();
+                                    }
+                                    containter.setOriginal(image);
+                                    imageListLock.release();
+                                }
+                            });
+                            imageListLock.release();
+                        }
+                    }
+                }
+            });
+            downloadThread.start();
+
+            processingThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    for (int i = 0; i < mValues.size(); ++i) {
+                        try {
+                            imageListLock.acquire();
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                        ImageContainer imageContainer = mValues.get(i);
+                        imageListLock.release();
+
+                        while (imageContainer.getOriginal() == null) {
+                            try {
+                                Thread.sleep(100);
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                            }
+                            try {
+                                imageListLock.acquire();
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                            }
+                            imageContainer = mValues.get(i);
+                            imageListLock.release();
+                        }
+
+                        final Bitmap original = imageContainer.getOriginal();
+                        final Bitmap resultBitmap = Bitmap.createBitmap(
+                                original.getWidth(),
+                                original.getHeight(),
+                                Bitmap.Config.ARGB_8888);
+                        for (int x = 0; x< resultBitmap.getWidth(); ++x) {
+                            for (int y = 0; y < resultBitmap.getHeight(); ++y){
+                                int oldPixel = original.getPixel(x,y);
+
+                                int grayValue = (Color.red(oldPixel) + Color.green(oldPixel) + Color.blue(oldPixel)) /3;
+
+                                // 0xff00
+                                int newPixel = (((0xff * 0x100 + grayValue) * 0x100 + grayValue) * 0x100 + grayValue);
+                                resultBitmap.setPixel(x,y,newPixel);
+                            }
+                        }
+                        imageContainer.setModified(resultBitmap);
+                        try {
+                            imageListLock.acquire();
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                        mValues.get(i).setModified(resultBitmap);
+                        imageListLock.release();
+                    }
+                }
+            });
+            processingThread.start();
         }
 
         @Override
         public ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
             View view = LayoutInflater.from(parent.getContext())
-                                      .inflate(R.layout.item_list_content, parent, false);
+                    .inflate(R.layout.item_list_content, parent, false);
             return new ViewHolder(view);
         }
 
         @Override
-        public void onBindViewHolder(final ViewHolder holder, int position) {
-            holder.mIdView.setText(mValues.get(position).id);
-            holder.mContentView.setText(mValues.get(position).content);
+        public void onBindViewHolder(final ViewHolder holder, final int position) {
+
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+
+                    try {
+                        imageListLock.acquire();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                    ImageContainer imageContainer = mValues.get(position);
+                    imageListLock.release();
+
+                    while(imageContainer.getOriginal() == null) {
+                        try {
+                            Thread.sleep(100);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+
+                        try {
+                            imageListLock.acquire();
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                        imageContainer = mValues.get(position);
+                        imageListLock.release();
+
+                    }
+
+                    final Bitmap original = imageContainer.getOriginal();
+
+                    mParentActivity.runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            holder.mOriginalView.setImageBitmap(original);
+
+                        }
+                    });
+
+                }
+            }).start();
 
             holder.itemView.setTag(mValues.get(position));
             holder.itemView.setOnClickListener(mOnClickListener);
@@ -127,13 +269,13 @@ public class ItemListActivity extends AppCompatActivity {
         }
 
         class ViewHolder extends RecyclerView.ViewHolder {
-            final TextView mIdView;
-            final TextView mContentView;
+            final ImageView mOriginalView;
+            final ImageView  mProcessedView;
 
             ViewHolder(View view) {
                 super(view);
-                mIdView = (TextView) view.findViewById(R.id.id_text);
-                mContentView = (TextView) view.findViewById(R.id.content);
+                mOriginalView =  view.findViewById(R.id.id_text);
+                mProcessedView =  view.findViewById(R.id.content);
             }
         }
     }
